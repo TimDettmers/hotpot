@@ -179,6 +179,7 @@ class EncoderRNN(nn.Module):
             output = self.dropout(output)
             if input_lengths is not None:
                 output = rnn.pack_padded_sequence(output, lens, batch_first=True)
+            self.rnns[i].flatten_parameters()
             output, hidden = self.rnns[i](output, hidden)
             if input_lengths is not None:
                 output, _ = rnn.pad_packed_sequence(output, batch_first=True)
