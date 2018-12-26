@@ -1,22 +1,30 @@
+import sys
 import ujson as json
 import numpy as np
-from tqdm import tqdm
 import os
-from torch import optim, nn
-from model import Model #, NoCharModel, NoSelfModel
-from sp_model import SPModel
-# from normal_model import NormalModel, NoSelfModel, NoCharModel, NoSentModel
-# from oracle_model import OracleModel, OracleModelV2
-# from util import get_record_parser, convert_tokens, evaluate, get_batch_dataset, get_dataset
-from util import convert_tokens, evaluate
-from util import get_buckets, DataIterator, IGNORE_INDEX
 import time
 import shutil
 import random
 import torch
-from torch.autograd import Variable
-import sys
+import apex
+
 from torch.nn import functional as F
+from torch.autograd import Variable
+from torch import optim, nn
+from tqdm import tqdm
+from apex import amp
+from apex.fp16_utils import FP16_Optimizer
+amp_handle = None
+
+import torch.utils.data
+import torch.utils.data.distributed
+import torch.distributed as dist
+
+from model import Model #, NoCharModel, NoSelfModel
+from sp_model import SPModel
+from util import convert_tokens, evaluate
+from util import get_buckets, DataIterator, IGNORE_INDEX
+from apex.parallel import DistributedDataParallel as DDP
 
 def create_exp_dir(path, scripts_to_save=None):
     if not os.path.exists(path):
@@ -31,7 +39,7 @@ def create_exp_dir(path, scripts_to_save=None):
             shutil.copyfile(script, dst_file)
 
 nll_sum = nn.CrossEntropyLoss(reduction='sum', ignore_index=IGNORE_INDEX)
-nll_average = nn.CrossEntropyLoss(reduction='elementwise_mean', ignore_index=IGNORE_INDEX)
+nll_average = nn.CrossEntropyLoss(reduction='mean', ignore_index=IGNORE_INDEX)
 nll_all = nn.CrossEntropyLoss(reduction='none', ignore_index=IGNORE_INDEX)
 
 def train(config):
@@ -50,6 +58,7 @@ def train(config):
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
+    kwargs = {'num_workers': 1, 'pin_memory': True}
 
     config.save = '{}-{}'.format(config.save, time.strftime("%Y%m%d-%H%M%S"))
     create_exp_dir(config.save, scripts_to_save=['run.py', 'model.py', 'util.py', 'sp_model.py'])
@@ -68,23 +77,87 @@ def train(config):
     train_buckets = get_buckets(config.train_record_file)
     dev_buckets = get_buckets(config.dev_record_file)
 
+    full_batch_size = 89791
+    print(len(train_buckets))
+    print(len(train_buckets[0]))
+
+    logging('Unrolling data iterator...')
+    keys = ['context_idxs', 'ques_idxs', 'context_char_idxs',
+            'ques_char_idxs',
+            'y1', 'y2']
+    # TODO: context_lens, q_type, is_support, start_mapping, end_mapping, all_mapping
+    tensors = []
+    for i in range(len(keys)): tensors.append([])
+    for j, dp in enumerate(train_buckets[0]):
+        for i, key in enumerate(keys):
+            if isinstance(dp[key], torch.Tensor):
+                tensors[i].append(dp[key])
+            else:
+                tensors[i].append(torch.Tensor([dp[key]]))
+
+
+
+    for i in range(len(keys)):
+        dataset[i] = torch.cat(tensors[i], dim=0)
+
+
+    print('concat!')
+
+
     def build_train_iterator():
-        return DataIterator(train_buckets, config.batch_size, config.para_limit, config.ques_limit, config.char_limit, True, config.sent_limit)
+        return DataIterator(train_buckets, full_batch_size, config.para_limit, config.ques_limit, config.char_limit, True, config.sent_limit, False)
 
     def build_dev_iterator():
         return DataIterator(dev_buckets, config.batch_size, config.para_limit, config.ques_limit, config.char_limit, False, config.sent_limit)
 
-    if config.sp_lambda > 0:
-        model = SPModel(config, word_mat, char_mat)
-    else:
-        model = Model(config, word_mat, char_mat)
+    # I will not touch the DataIterator — magic code!
+    #train_iter = list(build_train_iterator())
+    # the order is important here
 
-    logging('nparams {}'.format(sum([p.nelement() for p in model.parameters() if p.requires_grad])))
-    ori_model = model.cuda()
-    model = nn.DataParallel(ori_model)
+    if config.sp_lambda > 0:
+        ori_model = SPModel(config, word_mat, char_mat)
+    else:
+        ori_model = Model(config, word_mat, char_mat)
+
+
+    logging('nparams {}'.format(sum([p.nelement() for p in ori_model.parameters() if p.requires_grad])))
+    if config.fp16:
+        ori_model.type(torch.cuda.HalfTensor)
+        amp_handle = amp.init()
+    else:
+        ori_model.type(torch.cuda.FloatTensor)
+
+
+    train_dataset = torch.utils.data.TensorDataset(tensors)
+
+    print('DIST', config.distributed)
+    if config.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, sampler=train_sampler,
+        batch_size=config.batch_size, shuffle=(train_sampler is None), **kwargs
+    )
+
+    config.distributed = False
+    if 'WORLD_SIZE' in os.environ:
+        config.distributed = int(os.environ['WORLD_SIZE']) > 1
+
+    if config.distributed:
+        #assert config.cuda, "Distributed mode requires running with CUDA."
+        torch.cuda.set_device(config.local_rank)
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+    #model = nn.DataParallel(ori_model)
+    if config.distributed:
+        model = DDP(ori_model)
 
     lr = config.init_lr
     optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=config.init_lr)
+    #if config.fp16:
+    #    optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
     cur_patience = 0
     total_loss = 0
     global_step = 0
@@ -95,27 +168,34 @@ def train(config):
     model.train()
 
     for epoch in range(10000):
-        for data in build_train_iterator():
-            context_idxs = Variable(data['context_idxs'])
-            ques_idxs = Variable(data['ques_idxs'])
-            context_char_idxs = Variable(data['context_char_idxs'])
-            ques_char_idxs = Variable(data['ques_char_idxs'])
-            context_lens = Variable(data['context_lens'])
-            y1 = Variable(data['y1'])
-            y2 = Variable(data['y2'])
-            q_type = Variable(data['q_type'])
-            is_support = Variable(data['is_support'])
-            start_mapping = Variable(data['start_mapping'])
-            end_mapping = Variable(data['end_mapping'])
-            all_mapping = Variable(data['all_mapping'])
+        for batch_idx, tensors in enumerate(train_loader):
+            data, target = data.cuda(), target.cuda()
+            optimizer.zero_grad()
+
+            print(len(tensors))
+            #context_idxs = Variable(data['context_idxs'])
+            #ques_idxs = Variable(data['ques_idxs'])
+            #context_char_idxs = Variable(data['context_char_idxs'])
+            #ques_char_idxs = Variable(data['ques_char_idxs'])
+            #context_lens = Variable(data['context_lens'])
+            #y1 = Variable(data['y1'])
+            #y2 = Variable(data['y2'])
+            #q_type = Variable(data['q_type'])
+            #is_support = Variable(data['is_support'])
+            #start_mapping = Variable(data['start_mapping'])
+            #end_mapping = Variable(data['end_mapping'])
+            #all_mapping = Variable(data['all_mapping'])
 
             logit1, logit2, predict_type, predict_support = model(context_idxs, ques_idxs, context_char_idxs, ques_char_idxs, context_lens, start_mapping, end_mapping, all_mapping, return_yp=False)
             loss_1 = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0)
             loss_2 = nll_average(predict_support.view(-1, 2), is_support.view(-1))
             loss = loss_1 + config.sp_lambda * loss_2
 
-            optimizer.zero_grad()
-            loss.backward()
+            if config.fp16:
+                with amp_handle.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
             optimizer.step()
 
             total_loss += loss.data.item()

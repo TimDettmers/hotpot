@@ -1,1 +1,2 @@
 joblib
+-e git+https://github.com/NVIDIA/apex.git#egg=apex

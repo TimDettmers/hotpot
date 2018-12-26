@@ -66,6 +66,10 @@ parser.add_argument('--data_split', type=str, default='train')
 parser.add_argument('--fullwiki', action='store_true')
 parser.add_argument('--prediction_file', type=str)
 parser.add_argument('--sp_threshold', type=float, default=0.3)
+parser.add_argument('--fp16', action='store_true')
+
+parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument("--distributed", action='store_true')
 
 config = parser.parse_args()
 
